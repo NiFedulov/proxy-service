@@ -24,12 +24,10 @@ func loadCfg() (cfg, error) {
 	if downstreamURL == "" {
 		return cfg{}, fmt.Errorf("DOWNSTREAM_URL is required")
 	}
-
 	downstreamAPIKey := os.Getenv("DOWNSTREAM_API_KEY")
 	if downstreamAPIKey == "" {
 		return cfg{}, fmt.Errorf("DOWNSTREAM_API_KEY is required")
 	}
-
 	apiKeys := make(map[string]struct{})
 	for _, k := range strings.Split(os.Getenv("API_KEYS"), ",") {
 		k = strings.TrimSpace(k)
@@ -40,14 +38,12 @@ func loadCfg() (cfg, error) {
 	if len(apiKeys) == 0 {
 		return cfg{}, fmt.Errorf("API_KEYS is required")
 	}
-
 	timeout := 30 * time.Second
 	if v := os.Getenv("REQUEST_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			timeout = d
 		}
 	}
-
 	return cfg{
 		downstreamURL:    downstreamURL,
 		downstreamAPIKey: downstreamAPIKey,
@@ -56,42 +52,38 @@ func loadCfg() (cfg, error) {
 	}, nil
 }
 
-func jsonError(w http.ResponseWriter, status int, msg string) {
+func jsonErr(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-func requestID() string {
+func reqID() string {
 	return fmt.Sprintf("%x-%x", time.Now().UnixNano(), rand.Uint32())
 }
 
-// Handler is the Vercel serverless entry point.
+// Handler is the Vercel serverless entry point for proxy requests.
+// Expects route: /proxy/:path* → /api/index?path=:path*
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// health check — no auth required
-	if r.URL.Path == "/health" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+	defer func() {
+		if p := recover(); p != nil {
+			jsonErr(w, http.StatusInternalServerError, fmt.Sprintf("panic: %v", p))
+		}
+	}()
 
 	c, err := loadCfg()
 	if err != nil {
-		jsonError(w, http.StatusInternalServerError, err.Error())
+		jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	// auth
-	key := r.Header.Get("X-API-Key")
-	if _, ok := c.apiKeys[key]; !ok {
-		jsonError(w, http.StatusUnauthorized, "unauthorized")
+	if _, ok := c.apiKeys[r.Header.Get("X-API-Key")]; !ok {
+		jsonErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
-	target, err := url.Parse(c.downstreamURL)
-	if err != nil {
-		jsonError(w, http.StatusInternalServerError, "invalid downstream URL")
-		return
-	}
+	target, _ := url.Parse(c.downstreamURL)
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = &http.Transport{
@@ -99,23 +91,25 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy.Director = func(req *http.Request) {
+		// Vercel passes captured :path* as query param when using
+		// destination "/api/index?path=:path*"
+		upstreamPath := "/" + req.URL.Query().Get("path")
+
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
-		// strip /proxy prefix if present
-		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/proxy")
-		if req.URL.Path == "" {
-			req.URL.Path = "/"
-		}
+		req.URL.Path = upstreamPath
+		req.URL.RawQuery = "" // remove the internal ?path= param
 		req.Host = target.Host
+
 		req.Header.Del("X-API-Key")
 		req.Header.Set("X-API-Key", c.downstreamAPIKey)
 		if req.Header.Get("X-Request-ID") == "" {
-			req.Header.Set("X-Request-ID", requestID())
+			req.Header.Set("X-Request-ID", reqID())
 		}
 	}
 
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		jsonError(w, http.StatusBadGateway, "bad gateway")
+		jsonErr(w, http.StatusBadGateway, "bad gateway")
 	}
 
 	proxy.ServeHTTP(w, r)
