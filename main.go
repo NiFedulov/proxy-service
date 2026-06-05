@@ -43,8 +43,15 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	// Vercel sets PORT; fall back to LISTEN_ADDR for local run
+	addr := cfg.ListenAddr
+	if port := os.Getenv("PORT"); port != "" {
+		addr = ":" + port
+	}
+	srv.Addr = addr
+
 	go func() {
-		slog.Info("proxy service starting", "addr", cfg.ListenAddr, "downstream", cfg.DownstreamURL)
+		slog.Info("proxy service starting", "addr", addr, "downstream", cfg.DownstreamURL)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server error", "error", err)
 			os.Exit(1)
