@@ -38,6 +38,12 @@ func main() {
 	claudeHandler := NewClaudeHandler(cfg.RequestTimeout)
 	mux.Handle("POST /claude", APIKeyMiddleware(cfg.APIKeys)(claudeHandler))
 
+	// bridge queue endpoints
+	mux.Handle("POST /send", APIKeyMiddleware(cfg.APIKeys)(http.HandlerFunc(sendHandler)))
+	mux.Handle("GET /result/{id}", APIKeyMiddleware(cfg.APIKeys)(http.HandlerFunc(resultHandler)))
+	mux.Handle("GET /poll", APIKeyMiddleware(cfg.APIKeys)(http.HandlerFunc(pollHandler)))
+	mux.Handle("POST /done/{id}", APIKeyMiddleware(cfg.APIKeys)(http.HandlerFunc(doneHandler)))
+
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
 		Handler:      mux,
