@@ -13,6 +13,7 @@ type anthropicRequest struct {
 	Model     string             `json:"model"`
 	MaxTokens int                `json:"max_tokens"`
 	Messages  []anthropicMessage `json:"messages"`
+	Stream    bool               `json:"stream"`
 }
 
 type anthropicMessage struct {
@@ -20,16 +21,16 @@ type anthropicMessage struct {
 	Content any    `json:"content"` // string or []block
 }
 
-// Anthropic API response format
+// Anthropic API response format (non-streaming)
 type anthropicResponse struct {
-	ID           string            `json:"id"`
-	Type         string            `json:"type"`
-	Role         string            `json:"role"`
-	Model        string            `json:"model"`
-	Content      []anthropicBlock  `json:"content"`
-	StopReason   string            `json:"stop_reason"`
-	StopSequence *string           `json:"stop_sequence"`
-	Usage        anthropicUsage    `json:"usage"`
+	ID           string         `json:"id"`
+	Type         string         `json:"type"`
+	Role         string         `json:"role"`
+	Model        string         `json:"model"`
+	Content      []anthropicBlock `json:"content"`
+	StopReason   string         `json:"stop_reason"`
+	StopSequence *string        `json:"stop_sequence"`
+	Usage        anthropicUsage `json:"usage"`
 }
 
 type anthropicBlock struct {
@@ -69,9 +70,17 @@ func extractText(msgs []anthropicMessage) string {
 	return ""
 }
 
-// POST /send/messages  — Anthropic-compatible endpoint routed through local bridge.
-// Chatbox sets API Host = https://proxy-service-red.vercel.app/send
-// and calls /send/messages automatically.
+// sseEvent writes a single SSE data line.
+func sseEvent(w http.ResponseWriter, v any) {
+	b, _ := json.Marshal(v)
+	fmt.Fprintf(w, "data: %s\n\n", b)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// POST /send/messages — Anthropic-compatible endpoint routed through local bridge.
+// Chatbox: set API Host = https://proxy-service-red.vercel.app/send
 func sendMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	var req anthropicRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -79,24 +88,23 @@ func sendMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	message := extractText(req.Messages)
+	// build message text (include conversation history)
+	var message string
+	if len(req.Messages) == 1 {
+		message = extractText(req.Messages)
+	} else {
+		var parts []string
+		for _, m := range req.Messages {
+			text := extractText([]anthropicMessage{m})
+			if text != "" {
+				parts = append(parts, fmt.Sprintf("%s: %s", m.Role, text))
+			}
+		}
+		message = strings.Join(parts, "\n")
+	}
 	if message == "" {
 		jsonResp(w, http.StatusBadRequest, map[string]string{"error": "no user message found"})
 		return
-	}
-
-	// build prompt with full conversation context if multiple messages
-	if len(req.Messages) > 1 {
-		var parts []string
-		for _, m := range req.Messages {
-			text := ""
-			switch v := m.Content.(type) {
-			case string:
-				text = v
-			}
-			parts = append(parts, fmt.Sprintf("%s: %s", m.Role, text))
-		}
-		message = strings.Join(parts, "\n")
 	}
 
 	// enqueue job
@@ -122,18 +130,18 @@ func sendMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// wait for local bridge to respond (60s timeout)
+	// wait for local bridge (60s)
 	select {
 	case <-j.done:
 	case <-time.After(60 * time.Second):
 		jsonResp(w, http.StatusGatewayTimeout, map[string]string{
-			"error": "bridge did not respond in time — make sure bridge is running locally",
+			"error": "bridge did not respond — make sure bridge is running locally",
 		})
 		return
 	}
 
 	mu.RLock()
-	response := j.Response
+	response := strings.TrimSpace(j.Response)
 	errMsg := j.Error
 	model := req.Model
 	mu.RUnlock()
@@ -143,14 +151,63 @@ func sendMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// return Anthropic-compatible response
+	msgID := "msg_bridge_" + id
+
+	if req.Stream {
+		// SSE streaming response (Chatbox default)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+
+		sseEvent(w, map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": msgID, "type": "message", "role": "assistant",
+				"model": model, "content": []any{}, "stop_reason": nil,
+				"usage": map[string]int{"input_tokens": 0, "output_tokens": 0},
+			},
+		})
+		sseEvent(w, map[string]any{
+			"type":          "content_block_start",
+			"index":         0,
+			"content_block": map[string]string{"type": "text", "text": ""},
+		})
+		sseEvent(w, map[string]any{"type": "ping"})
+
+		// send response in chunks of ~20 chars so Chatbox renders progressively
+		chunk := []rune(response)
+		size := 20
+		for i := 0; i < len(chunk); i += size {
+			end := i + size
+			if end > len(chunk) {
+				end = len(chunk)
+			}
+			sseEvent(w, map[string]any{
+				"type":  "content_block_delta",
+				"index": 0,
+				"delta": map[string]string{"type": "text_delta", "text": string(chunk[i:end])},
+			})
+		}
+
+		sseEvent(w, map[string]any{"type": "content_block_stop", "index": 0})
+		sseEvent(w, map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]string{"stop_reason": "end_turn"},
+			"usage": map[string]int{"output_tokens": len(strings.Fields(response))},
+		})
+		sseEvent(w, map[string]any{"type": "message_stop"})
+		return
+	}
+
+	// non-streaming JSON response
 	jsonResp(w, http.StatusOK, anthropicResponse{
-		ID:         "msg_bridge_" + id,
+		ID:         msgID,
 		Type:       "message",
 		Role:       "assistant",
 		Model:      model,
-		Content:    []anthropicBlock{{Type: "text", Text: strings.TrimSpace(response)}},
+		Content:    []anthropicBlock{{Type: "text", Text: response}},
 		StopReason: "end_turn",
-		Usage:      anthropicUsage{},
+		Usage:      anthropicUsage{OutputTokens: len(strings.Fields(response))},
 	})
 }
