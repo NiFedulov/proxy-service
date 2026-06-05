@@ -35,6 +35,9 @@ func main() {
 	authed := APIKeyMiddleware(cfg.APIKeys)(proxyHandler)
 	mux.Handle("/proxy/", http.StripPrefix("/proxy", authed))
 
+	claudeHandler := NewClaudeHandler(cfg.RequestTimeout)
+	mux.Handle("POST /claude", APIKeyMiddleware(cfg.APIKeys)(claudeHandler))
+
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
 		Handler:      mux,
