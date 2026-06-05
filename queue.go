@@ -23,6 +23,7 @@ type job struct {
 	Response string    `json:"response,omitempty"`
 	Error    string    `json:"error,omitempty"`
 	created  time.Time
+	done     chan struct{} // closed when job is complete
 }
 
 var (
@@ -61,7 +62,7 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := newID()
-	j := &job{ID: id, Message: req.Message, Status: statusPending, created: time.Now()}
+	j := &job{ID: id, Message: req.Message, Status: statusPending, created: time.Now(), done: make(chan struct{})}
 
 	mu.Lock()
 	jobsMap[id] = j
@@ -130,6 +131,7 @@ func doneHandler(w http.ResponseWriter, r *http.Request) {
 		j.Status = statusCompleted
 		j.Response = result.Response
 		j.Error = result.Error
+		close(j.done) // signal waiters
 	}
 	mu.Unlock()
 

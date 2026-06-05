@@ -44,6 +44,10 @@ func main() {
 	mux.Handle("GET /poll", APIKeyMiddleware(cfg.APIKeys)(http.HandlerFunc(pollHandler)))
 	mux.Handle("POST /done/{id}", APIKeyMiddleware(cfg.APIKeys)(http.HandlerFunc(doneHandler)))
 
+	// Anthropic-compatible endpoint → routes through local bridge
+	// Chatbox: set API Host = https://proxy-service-red.vercel.app/send
+	mux.Handle("POST /send/messages", APIKeyMiddleware(cfg.APIKeys)(http.HandlerFunc(sendMessagesHandler)))
+
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
 		Handler:      mux,
